@@ -30,46 +30,92 @@ export async function main(ns) {
   const ramHack = 1.70; const ramGrow = 1.75; const ramWeaken = 1.75;
   let asignacionesNuevas = 0;
 
-  // ==========================================================================
-  // INICIALIZACIÓN DEL ESTADO VIRTUAL DE LA RED (IN-FLIGHT)
-  // ==========================================================================
-  let seguridadVirtual = seguridadReal;
-  let dineroVirtual = dineroReal;
+  // Helpers y constantes para robustecer cálculos
+  const MAX_GROW_THREADS = 1e6; // umbral de sanity para growthAnalyze
+  const SECURITY_SLACK = 0.01; // tolerancia aceptable en cambio de seguridad neto por lote
+
+  function safeCeil(v) { return Math.max(1, Math.ceil(v)); }
+
+  // Unifica el modelo de crecimiento: usa ns.formulas si está disponible, si no usa exponencial
+  function simulateGrowMultiplier(ns, objetivo, serverGrowthFactor, growThreads, datosScoutLocal) {
+    try {
+      if (datosScoutLocal.modoFormulas && typeof ns.formulas !== 'undefined' && ns.formulas.hacking && ns.formulas.hacking.growthPercent) {
+        const serverPlat = ns.getServer(objetivo);
+        serverPlat.hackDifficulty = serverPlat.minDifficulty;
+        serverPlat.moneyAvailable = datosScoutLocal.saludObjetivo.dineroMaximo;
+        // ns.formulas.hacking.growthPercent devuelve % de crecimiento por threads
+        const pct = ns.formulas.hacking.growthPercent(serverPlat, ns.getPlayer(), growThreads) || 0;
+        // pct is percent (e.g. 150 for 1.5x?) formulas vary; convert to multiplier safely
+        const multiplier = 1 + (pct / 100);
+        return multiplier;
+      }
+    } catch (e) {
+      // fall through to empirical model
+    }
+    // fallback exponencial model: multiplier = exp((serverGrowthFactor/100) * threads)
+    return Math.exp((serverGrowthFactor / 100) * growThreads);
+  }
+
+  // Safe growthAnalyze wrapper with cap and fallback
+  function safeGrowthAnalyze(ns, objetivo, multiplier) {
+    try {
+      const threads = ns.growthAnalyze(objetivo, multiplier);
+      if (!isFinite(threads) || threads <= 0) return null;
+      if (threads > MAX_GROW_THREADS) return null;
+      return Math.ceil(threads);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Heurística para estimar hack chance cuando no hay formulas
+  function estimateHackChance(ns, objetivo) {
+    try {
+      if (typeof ns.formulas !== 'undefined' && ns.formulas.hacking && ns.formulas.hacking.hackChance) {
+        const serverPlat = ns.getServer(objetivo);
+        serverPlat.hackDifficulty = serverPlat.minDifficulty;
+        serverPlat.moneyAvailable = datosScout.saludObjetivo.dineroMaximo;
+        return ns.formulas.hacking.hackChance(serverPlat, ns.getPlayer()) || 0.0;
+      }
+    } catch (e) { }
+
+    // Fallback heuristic similar to scout.js
+    const miNivelHacking = ns.getHackingLevel();
+    const seguridadMinLocal = ns.getServerMinSecurityLevel(objetivo);
+    const seguridadActualLocal = ns.getServerSecurityLevel(objetivo);
+    const nivelReq = ns.getServerRequiredHackingLevel(objetivo);
+    let chanceExitoOptima = (100 - seguridadMinLocal) * 0.01 * ((miNivelHacking - nivelReq + 50) / (miNivelHacking + 50));
+    chanceExitoOptima = Math.min(Math.max(chanceExitoOptima, 0), 1);
+    return chanceExitoOptima;
+  }
+
+  // Calcula hilos weaken necesarios para mitigar un incremento de seguridad dado
+  function weakenThreadsForSecurityIncrease(secIncrease) {
+    return Math.max(1, Math.ceil(secIncrease / 0.05));
+  }
 
   const serverGrowthFactor = ns.getServerGrowth(objetivo);
+  const hackChanceGlobal = estimateHackChance(ns, objetivo);
 
   // --- NUEVO: CÁLCULO DE TIEMPOS "PLATÓNICOS" ---
-  // Tactical ahora calcula los tiempos ideales (cuando el objetivo está en seguridad mínima)
-  // y los publica en datosScout.tiemposCalculados para que el Deployer los use como fuente
-  // de verdad en lugar de recalcular en vuelo.
   try {
     let tWeakenPerfecto = null;
     let tHackPerfecto = null;
     let tGrowPerfecto = null;
 
     if (datosScout.modoFormulas && typeof ns.formulas !== "undefined" && ns.formulas.hacking) {
-      // Usamos las fórmulas oficiales forzando el estado "platonico" del servidor
       const serverPlat = ns.getServer(objetivo);
       serverPlat.hackDifficulty = serverPlat.minDifficulty;
       serverPlat.moneyAvailable = dineroMax;
       const player = ns.getPlayer();
 
-      // ns.formulas.hacking.* devuelve tiempos en ms
-      if (ns.formulas.hacking.weakenTime) {
-        tWeakenPerfecto = ns.formulas.hacking.weakenTime(serverPlat, player);
-      }
-      if (ns.formulas.hacking.hackTime) {
-        tHackPerfecto = ns.formulas.hacking.hackTime(serverPlat, player);
-      }
-      if (ns.formulas.hacking.growTime) {
-        tGrowPerfecto = ns.formulas.hacking.growTime(serverPlat, player);
-      }
+      if (ns.formulas.hacking.weakenTime) tWeakenPerfecto = ns.formulas.hacking.weakenTime(serverPlat, player);
+      if (ns.formulas.hacking.hackTime) tHackPerfecto = ns.formulas.hacking.hackTime(serverPlat, player);
+      if (ns.formulas.hacking.growTime) tGrowPerfecto = ns.formulas.hacking.growTime(serverPlat, player);
     }
 
-    // Fallback empírico: ajustamos el tiempo actual según la proporción entre seguridad mínima y actual
     if (tWeakenPerfecto === null) {
       const tWeakenActual = ns.getWeakenTime(objetivo);
-      // Evitamos división por cero y forzamos que el perfecto nunca sea mayor al actual por accidente
       const ratioWeaken = Math.max(0.0001, seguridadMin / Math.max(seguridadReal, seguridadMin));
       tWeakenPerfecto = Math.max(20, Math.round(tWeakenActual * ratioWeaken));
     }
@@ -84,7 +130,6 @@ export async function main(ns) {
       tGrowPerfecto = Math.max(20, Math.round(tGrowActual * ratioGrow));
     }
 
-    // Publicamos los tiempos calculados para que el Deployer los consuma como fuente única
     datosScout.tiemposCalculados = datosScout.tiemposCalculados || {};
     datosScout.tiemposCalculados.objetivo = objetivo;
     datosScout.tiemposCalculados.calculadoEn = Date.now();
@@ -93,11 +138,10 @@ export async function main(ns) {
     datosScout.tiemposCalculados.tGrowPerfecto = tGrowPerfecto;
 
   } catch (e) {
-    // En caso de error, no rompemos la planificación — simplemente no exponemos tiemposCalculados
     ns.print(`[Tactical] Error calculando tiempos platonicos: ${e}`);
   }
 
-  // Sumamos el impacto proyectado de los batches que ya están activos
+  // Sumamos el impacto proyectado de los batches que ya están activos usando el MODELO UNIFICADO DE GROW
   for (let nodo of inventarioRed) {
     if (nodo.recetaAsignada !== null) {
       let receta = datosScout.recetasEstructurales[nodo.recetaAsignada];
@@ -108,18 +152,19 @@ export async function main(ns) {
         if (receta.hack > 0) {
           let pctPorHiloHack = ns.hackAnalyze(objetivo) || 0.002;
           let pctRoboTotal = pctPorHiloHack * receta.hack;
+          // Aplicar probabilidad de éxito
+          let expectedPct = pctRoboTotal * hackChanceGlobal;
           for (let c = 0; c < cant; c++) {
-            dineroVirtual = Math.max(0, dineroVirtual * (1 - pctRoboTotal));
+            dineroVirtual = Math.max(0, dineroVirtual * (1 - expectedPct));
           }
           seguridadVirtual += receta.hack * 0.002 * cant;
         }
 
-        // Impacto del Grow en vuelo (Suma dinero, suma seguridad)
+        // Impacto del Grow en vuelo (Suma dinero, suma seguridad) - UNIFICADO
         if (receta.grow > 0) {
-          // Ajuste elástico del factor de crecimiento usando el multiplicador base del juego
-          let factorCrecimiento = 1 + ((serverGrowthFactor / 100) * receta.grow);
+          let multiplier = simulateGrowMultiplier(ns, objetivo, serverGrowthFactor, receta.grow, datosScout);
           for (let c = 0; c < cant; c++) {
-            dineroVirtual = Math.min(dineroMax, dineroVirtual * factorCrecimiento);
+            dineroVirtual = Math.min(dineroMax, dineroVirtual * multiplier);
           }
           seguridadVirtual += receta.grow * 0.004 * cant;
         }
@@ -134,7 +179,7 @@ export async function main(ns) {
   }
 
   // ==========================================================================
-  // ASIGNACIÓN SECUENCIAL CON SIMULACIÓN VIRTUAL
+  // ASIGNACIÓN SECUENCIAL CON SIMULACIÓN VIRTUAL Y VALIDACIÓN DE RECETAS
   // ==========================================================================
   let nuevasRecetas = {};
 
@@ -142,32 +187,22 @@ export async function main(ns) {
     const serverName = nodo.nombre;
     const ramMaxNode = nodo.ramMax;
 
-    // --- MEJORA SCOUT EN ALINEACIÓN CON EL NUEVO DOBLE CHEQUEO ---
-    // Si el nodo está bloqueado por tiempo o retención de RAM, preservamos sus recetas
+    // --- Si el nodo está bloqueado por tiempo o retención de RAM, preservamos sus recetas ---
     if (nodo.recetaAsignada !== null || nodo.batchExpiraEn !== null) {
-
       const idWeakenPuro = `WEAKEN_PURO_${ramMaxNode}`;
       const idGrowCompuesto = `GROW_COMPUESTO_${ramMaxNode}`;
       const idCosechaHWGW = `COSECHA_HWGW_${ramMaxNode}`;
 
-      if (datosScout.recetasEstructurales[idWeakenPuro]) {
-        nuevasRecetas[idWeakenPuro] = datosScout.recetasEstructurales[idWeakenPuro];
-      }
-      if (datosScout.recetasEstructurales[idGrowCompuesto]) {
-        nuevasRecetas[idGrowCompuesto] = datosScout.recetasEstructurales[idGrowCompuesto];
-      }
-      if (datosScout.recetasEstructurales[idCosechaHWGW]) {
-        nuevasRecetas[idCosechaHWGW] = datosScout.recetasEstructurales[idCosechaHWGW];
-      }
+      if (datosScout.recetasEstructurales[idWeakenPuro]) nuevasRecetas[idWeakenPuro] = datosScout.recetasEstructurales[idWeakenPuro];
+      if (datosScout.recetasEstructurales[idGrowCompuesto]) nuevasRecetas[idGrowCompuesto] = datosScout.recetasEstructurales[idGrowCompuesto];
+      if (datosScout.recetasEstructurales[idCosechaHWGW]) nuevasRecetas[idCosechaHWGW] = datosScout.recetasEstructurales[idCosechaHWGW];
 
       continue;
     }
 
-    // Filtro de reserva para Home
+    // Reserva para home
     let ramTecho = ramMaxNode;
-    if (serverName === "home") {
-      ramTecho = Math.max(0, ramMaxNode - 32);
-    }
+    if (serverName === "home") ramTecho = Math.max(0, ramMaxNode - 32);
 
     const ramUtil = ramTecho * 0.98;
     if (ramUtil < ramWeaken) continue;
@@ -176,22 +211,28 @@ export async function main(ns) {
     const idGrowCompuesto = `GROW_COMPUESTO_${ramMaxNode}`;
     const idCosechaHWGW = `COSECHA_HWGW_${ramMaxNode}`;
 
-    // ==========================================================================
-    // 1. Generar receta WEAKEN_PURO
-    // ==========================================================================
+    // =========================
+    // 1) WEAKEN_PURO
+    // =========================
     if (!datosScout.recetasEstructurales[idWeakenPuro]) {
+      const weakenThreads = Math.floor(ramUtil / ramWeaken);
       datosScout.recetasEstructurales[idWeakenPuro] = {
         hack: 0,
-        weakenA: Math.floor(ramUtil / ramWeaken),
+        weakenA: weakenThreads,
         grow: 0,
         weakenB: 0,
-        cantidad: 1
+        cantidad: 1,
+        meta: {
+          ramCost: weakenThreads * ramWeaken,
+          expectedSecurityDelta: -weakenThreads * 0.05,
+          sanity: 'ok'
+        }
       };
     }
 
-    // ==========================================================================
-    // 2. Generar receta GROW_COMPUESTO (Multi-batch adaptativo)
-    // ==========================================================================
+    // =========================
+    // 2) GROW_COMPUESTO (multi-batch)
+    // =========================
     if (!datosScout.recetasEstructurales[idGrowCompuesto]) {
       let hG = Math.floor(ramUtil / (ramGrow + (ramWeaken / 12.5)));
       hG = Math.max(1, hG);
@@ -206,18 +247,30 @@ export async function main(ns) {
       let cantidad = Math.floor(ramUtil / costeRecetaUnitaria);
       if (cantidad < 1) cantidad = 1;
 
+      // Validate grow effect using unified model and cap growthAnalyze
+      let safeHG = hG;
+      const multiplier = simulateGrowMultiplier(ns, objetivo, serverGrowthFactor, safeHG, datosScout);
+      let expectedMoneyAfter = dineroReal * multiplier;
+      let expectedSecurityDelta = safeHG * 0.004 - (hW * 0.05);
+
       datosScout.recetasEstructurales[idGrowCompuesto] = {
         hack: 0,
         weakenA: hW,
-        grow: hG,
+        grow: safeHG,
         weakenB: 0,
-        cantidad: cantidad
+        cantidad: cantidad,
+        meta: {
+          ramCost: costeRecetaUnitaria,
+          expectedMultiplier: multiplier,
+          expectedSecurityDelta: expectedSecurityDelta,
+          sanity: (expectedSecurityDelta <= SECURITY_SLACK) ? 'ok' : 'needs_more_weaken'
+        }
       };
     }
 
-    // ==========================================================================
-    // 3. Generar receta COSECHA_HWGW (Optimización Top-Down por Lotes Enteros Masivos)
-    // ==========================================================================
+    // =========================
+    // 3) COSECHA_HWGW
+    // =========================
     if (!datosScout.recetasEstructurales[idCosechaHWGW]) {
       let pctPorHiloHack = ns.hackAnalyze(objetivo) || 0.002;
 
@@ -228,56 +281,54 @@ export async function main(ns) {
       let mejorCantidad = 1;
       let maximaEficiencia = 0;
 
-      const techoRoboSeguro = 0.90; // Límite físico de seguridad para no vaciar el servidor
-      const pisoRoboMinimo = 0.02;  // No nos interesa bajar de un 2% por lote
-
-      // Margen de seguridad para la RAM del host (98% de la RAM disponible)
+      const techoRoboSeguro = 0.90; // no vaciar el servidor
+      const pisoRoboMinimo = 0.02;
       const ramSeguraDisponible = ramUtil * 0.98;
 
-      // Evaluamos escenarios: ¿Qué pasa si intentamos meter 1 lote masivo, 2 lotes, 3 lotes... hasta un límite lógico?
-      // Esto evita el cuello de botella de generar cientos de micro-lotes.
+      // buscamos escenario por número de lotes
       for (let testCantidad = 1; testCantidad <= 32; testCantidad++) {
-
-        // Calculamos cuánta RAM tiene permitida gastar UN SOLO lote en este escenario de "N" lotes
         let ramMaximaPorLote = ramSeguraDisponible / testCantidad;
 
-        // Búsqueda binaria o refinamiento lineal inverso para encontrar el % de robo óptimo para esa porción de RAM
-        let mejorPctParaEstaCantidad = 0;
         let tempHH = 1, tempHWA = 1, tempHG = 1, tempHWB = 1;
+        let mejorPctParaEstaCantidad = 0;
 
-        // Iteramos de forma descendente desde el techo seguro para maximizar la agresividad
         for (let testPct = techoRoboSeguro; testPct >= pisoRoboMinimo; testPct -= 0.01) {
           let hilosHack = Math.max(1, Math.floor(testPct / pctPorHiloHack));
           let hilosWeakenA = Math.ceil(hilosHack * 0.04);
 
-          // Calculamos crecimiento basándonos en el porcentaje exacto que esos hilos van a robar en la realidad
           let roboRealPct = hilosHack * pctPorHiloHack;
-          if (roboRealPct >= 1.0) continue; // Seguridad matemática elemental
+          if (roboRealPct >= 1.0) continue;
 
-          let hilosGrow = Math.ceil(ns.growthAnalyze(objetivo, 1 / (1 - roboRealPct)));
-          let hilosWeakenB = Math.ceil(hilosGrow * 0.08);
+          // threads needed to regrow
+          let growThreads = safeGrowthAnalyze(ns, objetivo, 1 / (1 - roboRealPct));
+          if (growThreads === null) {
+            // fallback heuristic: use exponential model inverse to estimate threads
+            growThreads = Math.max(1, Math.ceil(Math.log(1 / (1 - roboRealPct)) / (serverGrowthFactor / 100)));
+          }
+          let hilosWeakenB = Math.ceil(growThreads * 0.08);
 
-          let costeLoteUnico = (hilosHack * ramHack) + (hilosGrow * ramGrow) + ((hilosWeakenA + hilosWeakenB) * ramWeaken);
+          let costeLoteUnico = (hilosHack * ramHack) + (growThreads * ramGrow) + ((hilosWeakenA + hilosWeakenB) * ramWeaken);
 
-          // Si el lote perfecto balanceado cabe en la porción de RAM asignada, encontramos el techo para esta cantidad
           if (costeLoteUnico <= ramMaximaPorLote) {
             mejorPctParaEstaCantidad = roboRealPct;
             tempHH = hilosHack;
             tempHWA = hilosWeakenA;
-            tempHG = hilosGrow;
+            tempHG = growThreads;
             tempHWB = hilosWeakenB;
-            break; // Salimos del bucle de % porque este es el más alto (agresivo) que cabe en esta división
+            break;
           }
         }
 
-        // Si encontramos un porcentaje válido para esta cantidad de lotes, medimos su retorno total
         if (mejorPctParaEstaCantidad > 0) {
-          // Eficiencia real de la ráfaga completa: % de robo por lote * cantidad de lotes enteros
-          let eficienciaRetorno = mejorPctParaEstaCantidad * testCantidad;
+          // compute expected yield taking into account hack chance
+          const hackChanceLocal = hackChanceGlobal;
+          const expectedYieldPerLote = mejorPctParaEstaCantidad * dineroMax * hackChanceLocal;
+          const expectedYieldTotal = expectedYieldPerLote * testCantidad;
+          const costeTotal = Math.max(1, ( (tempHH * ramHack) + (tempHG * ramGrow) + ((tempHWA + tempHWB) * ramWeaken) ) * testCantidad);
+          const eficiencia = expectedYieldTotal / costeTotal;
 
-          // Preferimos este escenario si excede la eficiencia máxima encontrada
-          if (eficienciaRetorno > maximaEficiencia) {
-            maximaEficiencia = eficienciaRetorno;
+          if (eficiencia > maximaEficiencia) {
+            maximaEficiencia = eficiencia;
             mejorHH = tempHH;
             mejorHWA = tempHWA;
             mejorHG = tempHG;
@@ -287,27 +338,52 @@ export async function main(ns) {
         }
       }
 
-      // Fallback de emergencia: Si la RAM es tan diminuta que no entra ni un lote del 2%
+      // Fallback si no se encontró escenario
       if (maximaEficiencia === 0) {
         let testPct = pisoRoboMinimo;
-        mejorHH = Math.max(1, Math.floor(testPct / pctPorHiloHack));
-        mejorHG = Math.max(1, Math.ceil(ns.growthAnalyze(objetivo, 1 / (1 - testPct))));
-        mejorHWA = Math.max(1, Math.ceil(mejorHH * 0.04));
-        mejorHWB = Math.max(1, Math.ceil(mejorHG * 0.08));
-        mejorCantidad = 1;
+        let hh = Math.max(1, Math.floor(testPct / pctPorHiloHack));
+        let hg = safeGrowthAnalyze(ns, objetivo, 1 / (1 - testPct));
+        if (hg === null) hg = Math.max(1, Math.ceil(Math.log(1 / (1 - testPct)) / (serverGrowthFactor / 100)));
+        let hwa = Math.max(1, Math.ceil(hh * 0.04));
+        let hwb = Math.max(1, Math.ceil(hg * 0.08));
 
-        // Compresión agresiva de hilos por fuerza bruta si desborda la RAM del nodo
-        while (((mejorHH * ramHack) + (mejorHG * ramGrow) + ((mejorHWA + mejorHWB) * ramWeaken)) > ramUtil) {
-          if (mejorHG > mejorHH && mejorHG > 1) {
-            mejorHG--;
-            mejorHWB = Math.max(1, Math.ceil(mejorHG * 0.08));
-          } else if (mejorHH > 1) {
-            mejorHH--;
-            mejorHWA = Math.max(1, Math.ceil(mejorHH * 0.04));
-          } else {
-            break;
-          }
+        // compress until fits
+        while (((hh * ramHack) + (hg * ramGrow) + ((hwa + hwb) * ramWeaken)) > ramUtil) {
+          if (hg > hh && hg > 1) {
+            hg--;
+            hwb = Math.max(1, Math.ceil(hg * 0.08));
+          } else if (hh > 1) {
+            hh--;
+            hwa = Math.max(1, Math.ceil(hh * 0.04));
+          } else break;
         }
+
+        mejorHH = hh; mejorHG = hg; mejorHWA = hwa; mejorHWB = hwb; mejorCantidad = 1;
+      }
+
+      // Calculate meta telemetry and sanity checks
+      const pctPorHiloHackFinal = ns.hackAnalyze(objetivo) || 0.002;
+      const pctRoboTotalFinal = pctPorHiloHackFinal * mejorHH;
+      const expectedYieldPerLoteFinal = pctRoboTotalFinal * dineroMax * hackChanceGlobal;
+      const ramCostUnLoteFinal = (mejorHH * ramHack) + (mejorHG * ramGrow) + ((mejorHWA + mejorHWB) * ramWeaken);
+      const expectedSecurityDeltaFinal = (mejorHH * 0.002) + (mejorHG * 0.004) - ((mejorHWA + mejorHWB) * 0.05);
+
+      let sanity = 'ok';
+      if (expectedSecurityDeltaFinal > SECURITY_SLACK) {
+        // try to add weakens if RAM allows
+        let extraWeakenNeeded = weakenThreadsForSecurityIncrease(expectedSecurityDeltaFinal - SECURITY_SLACK);
+        let added = 0;
+        while (added < extraWeakenNeeded && ((mejorHWA + mejorHWB + added + 1) * ramWeaken + mejorHH * ramHack + mejorHG * ramGrow) <= ramUtil) {
+          added++;
+        }
+        if (added > 0) {
+          // distribute added weakens to weakenB preferentially
+          mejorHWB += Math.ceil(added / 2);
+          mejorHWA += Math.floor(added / 2);
+        }
+        // recompute
+        const newExpectedSecurityDelta = (mejorHH * 0.002) + (mejorHG * 0.004) - ((mejorHWA + mejorHWB) * 0.05);
+        if (newExpectedSecurityDelta > SECURITY_SLACK) sanity = 'security_risk';
       }
 
       datosScout.recetasEstructurales[idCosechaHWGW] = {
@@ -315,7 +391,13 @@ export async function main(ns) {
         weakenA: mejorHWA,
         grow: mejorHG,
         weakenB: mejorHWB,
-        cantidad: mejorCantidad
+        cantidad: mejorCantidad,
+        meta: {
+          expectedYieldPerLote: expectedYieldPerLoteFinal,
+          ramCostUnLote: ramCostUnLoteFinal,
+          expectedSecurityDelta: expectedSecurityDeltaFinal,
+          sanity: sanity
+        }
       };
     }
 
@@ -341,10 +423,10 @@ export async function main(ns) {
       let receta = datosScout.recetasEstructurales[idGrowCompuesto];
       const cant = receta.cantidad || 1;
 
-      // Reemplazo para el cálculo real de crecimiento exponencial
-      let factorCrecimiento = Math.exp((serverGrowthFactor / 100) * receta.grow);
+      // Usamos el modelo UNIFICADO para calcular el efecto del grow
+      let multiplier = simulateGrowMultiplier(ns, objetivo, serverGrowthFactor, receta.grow, datosScout);
       for (let c = 0; c < cant; c++) {
-        dineroVirtual = Math.min(dineroMax, dineroVirtual * factorCrecimiento);
+        dineroVirtual = Math.min(dineroMax, dineroVirtual * multiplier);
       }
       seguridadVirtual = Math.max(seguridadMin, seguridadVirtual + (receta.grow * 0.004 * cant) - (receta.weakenA * 0.05 * cant));
 
@@ -355,15 +437,17 @@ export async function main(ns) {
 
       let pctPorHiloHack = ns.hackAnalyze(objetivo) || 0.002;
       let pctRoboTotal = pctPorHiloHack * receta.hack;
+      // aplicamos hackChance a la expectativa
+      let expectedPct = pctRoboTotal * hackChanceGlobal;
 
       for (let c = 0; c < cant; c++) {
-        dineroVirtual = Math.max(0, dineroVirtual * (1 - pctRoboTotal));
+        dineroVirtual = Math.max(0, dineroVirtual * (1 - expectedPct));
       }
 
-      // Reemplazo para el cálculo real de crecimiento exponencial
-      let factorCrecimiento = Math.exp((serverGrowthFactor / 100) * receta.grow);
+      // efecto de grow con modelo unificado
+      let multiplier = simulateGrowMultiplier(ns, objetivo, serverGrowthFactor, receta.grow, datosScout);
       for (let c = 0; c < cant; c++) {
-        dineroVirtual = Math.min(dineroMax, dineroVirtual * factorCrecimiento);
+        dineroVirtual = Math.min(dineroMax, dineroVirtual * multiplier);
       }
 
       seguridadVirtual = Math.max(
