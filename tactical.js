@@ -38,6 +38,65 @@ export async function main(ns) {
 
   const serverGrowthFactor = ns.getServerGrowth(objetivo);
 
+  // --- NUEVO: CÁLCULO DE TIEMPOS "PLATÓNICOS" ---
+  // Tactical ahora calcula los tiempos ideales (cuando el objetivo está en seguridad mínima)
+  // y los publica en datosScout.tiemposCalculados para que el Deployer los use como fuente
+  // de verdad en lugar de recalcular en vuelo.
+  try {
+    let tWeakenPerfecto = null;
+    let tHackPerfecto = null;
+    let tGrowPerfecto = null;
+
+    if (datosScout.modoFormulas && typeof ns.formulas !== "undefined" && ns.formulas.hacking) {
+      // Usamos las fórmulas oficiales forzando el estado "platonico" del servidor
+      const serverPlat = ns.getServer(objetivo);
+      serverPlat.hackDifficulty = serverPlat.minDifficulty;
+      serverPlat.moneyAvailable = dineroMax;
+      const player = ns.getPlayer();
+
+      // ns.formulas.hacking.* devuelve tiempos en ms
+      if (ns.formulas.hacking.weakenTime) {
+        tWeakenPerfecto = ns.formulas.hacking.weakenTime(serverPlat, player);
+      }
+      if (ns.formulas.hacking.hackTime) {
+        tHackPerfecto = ns.formulas.hacking.hackTime(serverPlat, player);
+      }
+      if (ns.formulas.hacking.growTime) {
+        tGrowPerfecto = ns.formulas.hacking.growTime(serverPlat, player);
+      }
+    }
+
+    // Fallback empírico: ajustamos el tiempo actual según la proporción entre seguridad mínima y actual
+    if (tWeakenPerfecto === null) {
+      const tWeakenActual = ns.getWeakenTime(objetivo);
+      // Evitamos división por cero y forzamos que el perfecto nunca sea mayor al actual por accidente
+      const ratioWeaken = Math.max(0.0001, seguridadMin / Math.max(seguridadReal, seguridadMin));
+      tWeakenPerfecto = Math.max(20, Math.round(tWeakenActual * ratioWeaken));
+    }
+    if (tHackPerfecto === null) {
+      const tHackActual = ns.getHackTime(objetivo);
+      const ratioHack = Math.max(0.0001, seguridadMin / Math.max(seguridadReal, seguridadMin));
+      tHackPerfecto = Math.max(20, Math.round(tHackActual * ratioHack));
+    }
+    if (tGrowPerfecto === null) {
+      const tGrowActual = ns.getGrowTime(objetivo);
+      const ratioGrow = Math.max(0.0001, seguridadMin / Math.max(seguridadReal, seguridadMin));
+      tGrowPerfecto = Math.max(20, Math.round(tGrowActual * ratioGrow));
+    }
+
+    // Publicamos los tiempos calculados para que el Deployer los consuma como fuente única
+    datosScout.tiemposCalculados = datosScout.tiemposCalculados || {};
+    datosScout.tiemposCalculados.objetivo = objetivo;
+    datosScout.tiemposCalculados.calculadoEn = Date.now();
+    datosScout.tiemposCalculados.tWeakenPerfecto = tWeakenPerfecto;
+    datosScout.tiemposCalculados.tHackPerfecto = tHackPerfecto;
+    datosScout.tiemposCalculados.tGrowPerfecto = tGrowPerfecto;
+
+  } catch (e) {
+    // En caso de error, no rompemos la planificación — simplemente no exponemos tiemposCalculados
+    ns.print(`[Tactical] Error calculando tiempos platonicos: ${e}`);
+  }
+
   // Sumamos el impacto proyectado de los batches que ya están activos
   for (let nodo of inventarioRed) {
     if (nodo.recetaAsignada !== null) {
